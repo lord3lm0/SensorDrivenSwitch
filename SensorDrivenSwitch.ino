@@ -7,22 +7,14 @@
 #include <LiquidCrystal.h>
 #include <EEPROM.h>
 
-/* 
- * buttons from lcd panel
- */
-#define btnRIGHT  0
-#define btnUP     1
-#define btnDOWN   2
-#define btnLEFT   3
-#define btnSELECT 4
-#define btnNONE   5
+#define DEBUG 1
 
 /* 
  * settings as stored in eeprom 
  */
 struct settings {
   byte sw_version;       /* When not equal, dismiss old data */
-  byte threshold;        /* If sensor below this value, then turn on relais */
+  byte threshold;        /* If sensor below this value, then turn on the switch */
   byte on_time_sec;      /* Time relais is activated, in seconds */
   byte repeat_after_min; /* Time after when the sensor is evaluated, in minutes */
 };
@@ -36,6 +28,59 @@ struct settings {
 #define EEPROM_SETTINGS_REPEAT_AFTER_MIN 3
 
 /* 
+ * button names for buttons on lcd panel
+ */
+#define BTN_RIGHT  0
+#define BTN_UP     1
+#define BTN_DOWN   2
+#define BTN_LEFT   3
+#define BTN_SELECT 4
+#define BTN_NONE   5
+
+/* 
+ * Pin layout
+ */
+#define PIN_ADC_LCD_BUTTONS 0
+#define PIN_ADC_SENSOR      1
+#define PIN_IO_SWITCH       2
+
+/*
+ * The following is for a DFRobot lcd panel connected to an leonardo board.
+ */
+#define PIN_IO_RS           8
+#define PIN_IO_ENABLE       9
+#define PIN_IO_D4           4
+#define PIN_IO_D5           5
+#define PIN_IO_D6           6
+#define PIN_IO_D7           7
+
+#define LCD_WIDTH           16
+#define LCD_HEIGHT          2
+
+/*
+ * Menu item strings. Also define offset for values.
+ *                         "0123456789ABCDEF"
+ */
+const char* SENSOR_VALUE = "Sensor Read:    ";
+int SENSOR_VALUE_OFFSET = 0xC;
+const char* SWITCH_STATE = "Switch State:   ";
+int SWITCH_STATE_OFFSET = 0xD;
+
+#define NUM_MENU_ITEMS = 1;
+
+/*
+ * Global variables
+ */
+int sensor_val = 0;
+int switch_val = 0;
+int menu_item = 0;
+struct settings settings_eeprom;  /* copy of setting in eeprom */
+struct settings settings_current; /* settings as currently used */
+
+LiquidCrystal lcd(PIN_IO_RS, PIN_IO_ENABLE, PIN_IO_D4, PIN_IO_D5, PIN_IO_D6, PIN_IO_D7);
+
+
+/* 
  * Function prototypes 
  */
 void read_settings();
@@ -44,53 +89,27 @@ void fill_default_settings();
 void sync_settings();
 int read_lcd_buttons();
 int read_sensor();
-
-/* 
- * LCD object, select the pins used on the LCD panel.
- * The following is for a DFRobot lcd panel connected to an leonardo board.
- */
-LiquidCrystal lcd(8, 9, 4, 5, 6, 7);
-
-/* 
- * One copy of the settings as seen in eeprom, the other as last altered by user. 
- */
-struct settings settings_eeprom, settings_current;
-
-/* 
- * 
- */
-int lcd_key     = 0;
-int adc_key_in  = 0;
-int adc_sensor_in = 0;
-int prev_adc_key_in  = 0;
-int prev_adc_sensor_in = 0;
-int relais = 2;
+int draw_screen();
+int handle_user_input();
+int update_switch();
 
 /*
- * Menu item strings. Also define offset for values, so translations will be easier.
- *                         "0123456789ABCDEF"
- */
-const char* SENSOR_VALUE = "Sensor Read:    ";
-int SENSOR_VALUE_OFFSET = 0xC;
-const char* SWITCH_STATE = "Switch State:   ";
-int SWITCH_STATE_OFFSET = 0xD;
-
-/*
- * Each arduino program starts with the setup.
+ * Every arduino program starts with the setup.
  */
 void setup()
 {
-  pinMode(relais, OUTPUT); 
+  pinMode(PIN_IO_SWITCH, OUTPUT); 
 
-  lcd.begin(16, 2);      /* start the library, 16 width, 2 high */
+  lcd.begin(LCD_WIDTH, LCD_HEIGHT);
   lcd.clear();
-  lcd.setCursor(0,0);
   lcd.print("Wait For Serial"); 
 
+#ifdef DEBUG
   Serial.begin(9600);
   while (!Serial) { /* leonardo board has no ft chip, this way we don't miss any data */
-    if (read_lcd_buttons() == btnSELECT) break; /* But if a key is pressed we stop waiting for serial */
+    if (read_lcd_buttons() == BTN_SELECT) break; /* But if a key is pressed we stop waiting for serial */
   }
+#endif
 
   lcd.clear();
   lcd.print(SENSOR_VALUE);
@@ -100,57 +119,21 @@ void setup()
   /* Setting are read from eeprom when available */
   sync_settings();
 }
-/* ---------------------------------------------------------------------------------------------- */
 
+/*
+ * loop is the main loop which is executed repeatedly
+ */
 void loop()
 {
-  lcd.setCursor(SENSOR_VALUE_OFFSET,1);
-  lcd.print( read_sensor() );
-  
-  lcd.print("  ");
-
-  lcd.setCursor(0,1);            // move to the begining of the second line
-  lcd_key = read_lcd_buttons();  // read the buttons
-
-    switch (lcd_key)               // depending on which button was pushed, we perform an action
-  {
-  case btnRIGHT:
-    {
-      lcd.print("RIGHT  ");
-      break;
-    }
-  case btnLEFT:
-    {
-      lcd.print("LEFT    ");
-      break;
-    }
-  case btnUP:
-    {
-      lcd.print("UP     ");
-      digitalWrite(relais, HIGH);
-      break;
-    }
-  case btnDOWN:
-    {
-      lcd.print("DOWN   ");
-      digitalWrite(relais, LOW);
-      break;
-    }
-  case btnSELECT:
-    {
-      lcd.print("SELECT ");
-      break;
-    }
-  case btnNONE:
-    {
-      lcd.print("Sensor:");
-      break;
-    }
-  }
-
+  read_sensor();
+  draw_screen();
+  handle_user_input();
+  update_switch();
 }
 
-/* ---------------------------------------------------------------------------------------------- */
+/*
+ * read settings from eeprom
+ */
 void read_settings()
 {
   settings_eeprom.sw_version = EEPROM.read(EEPROM_SETTINGS_SW_VERSION);
@@ -158,7 +141,9 @@ void read_settings()
   settings_eeprom.on_time_sec = EEPROM.read(EEPROM_SETTINGS_ON_TIME_SEC);
   settings_eeprom.repeat_after_min = EEPROM.read(EEPROM_SETTINGS_REPEAT_AFTER_MIN);
 }
-/* ---------------------------------------------------------------------------------------------- */
+/*
+ *
+ */
 void write_settings()
 {
   if (settings_eeprom.sw_version != settings_current.sw_version) {
@@ -179,7 +164,9 @@ void write_settings()
   }
 
 }
-/* ---------------------------------------------------------------------------------------------- */
+/* 
+ * fill_default_settings
+ */
 void fill_default_settings()
 {
   settings_current.sw_version = 1;
@@ -187,7 +174,9 @@ void fill_default_settings()
   settings_current.on_time_sec = 0; /* Never On */
   settings_current.repeat_after_min = 60; /* 1 Hour */
 }
-/* ---------------------------------------------------------------------------------------------- */
+/* 
+ * sync_settings syncs current settings with eeprom
+ */
 void sync_settings()
 {
   fill_default_settings();
@@ -198,46 +187,104 @@ void sync_settings()
   }
   else { /* Copy settings from eeprom to current */
     settings_current = settings_eeprom;
-    settings_current.threshold != settings_eeprom.threshold;
-    settings_current.on_time_sec != settings_eeprom.on_time_sec;
-    settings_current.repeat_after_min != settings_eeprom.repeat_after_min;
   }
 }
-/* ---------------------------------------------------------------------------------------------- */
-// read the buttons
+
+/*
+ * The buttons from the lcd are connected via a adc pin, different analog values for different pins.
+ */
 int read_lcd_buttons()
 {
-
-  adc_key_in = analogRead(0);      // read the value from the sensor 
-  if (abs(prev_adc_key_in - adc_key_in) > 2) {
-    Serial.println( adc_key_in );   
-    prev_adc_key_in = adc_key_in;
+  static int prev_keys = 0;
+  int keys = analogRead(PIN_ADC_LCD_BUTTONS);
+#ifdef DEBUG  
+  if (abs(prev_keys - keys) > 2) {
+    Serial.println( keys );   
+    prev_keys = keys;
+#endif    
   }
 
-  // my buttons when read are centered at these valies: 0, 144, 329, 504, 741
-  // we add approx 50 to those values and check to see if we are close
-  if (adc_key_in > 1000) return btnNONE; // We make this the 1st option for speed reasons since it will be the most likely result
-  // For My board this threshold
-  if (adc_key_in < 50)   return btnRIGHT;  // 0
-  if (adc_key_in < 200)  return btnUP;     // 100
-  if (adc_key_in < 400)  return btnDOWN;   // 257
-  if (adc_key_in < 600)  return btnLEFT;   // 410
-  if (adc_key_in < 800)  return btnSELECT; // 642 
+  if (keys > 1000) return BTN_NONE;   /* most likely result */
+  if (keys < 50)   return BTN_RIGHT;  /* My value: 0 */
+  if (keys < 200)  return BTN_UP;     /* My value: 100 */
+  if (keys < 400)  return BTN_DOWN;   /* My value: 257 */
+  if (keys < 600)  return BTN_LEFT;   /* My value: 410 */
+  if (keys < 800)  return BTN_SELECT; /* My value: 642 */
 
-  return btnNONE;  // when all others fail, return this...
+  return BTN_NONE;
 }
-/* ---------------------------------------------------------------------------------------------- */
+
+/* 
+ * Read sensor just reads an analog value, only in debug mode it spits out more data
+ */
 int read_sensor()
 {
-  adc_sensor_in = analogRead(1);
-  if (abs(prev_adc_sensor_in - adc_sensor_in) > 2) {
-    Serial.print("Soil:");
-    Serial.println( adc_sensor_in );   
-    prev_adc_sensor_in = adc_sensor_in;
+  static int prev_sensor_val = 0;
+
+  sensor_val = analogRead(PIN_ADC_SENSOR);
+#ifdef DEBUG
+  /* Only display differences */
+  if (abs(prev_sensor_val - sensor_val) > 2) {
+    Serial.print("Sensor:");
+    Serial.println( sensor_val );   
+    prev_sensor_val = sensor_val;
   }
-  return adc_sensor_in;
+#endif
+  return sensor_val;
 }
-/* ---------------------------------------------------------------------------------------------- */
-/* ---------------------------------------------------------------------------------------------- */
+
+int draw_screen()
+{
+  lcd.setCursor(SENSOR_VALUE_OFFSET,0);
+  lcd.print( sensor_val );
+  lcd.print("  ");
+
+  lcd.setCursor(SWITCH_STATE_OFFSET,1);
+  if (switch_val == 0) lcd.print("Off");
+  else lcd.print("On ");
+}
+
+int handle_user_input()
+{
+  switch (read_lcd_buttons())  {
+  case BTN_RIGHT: 
+    {
+      break;
+    }
+  case BTN_LEFT: 
+    {
+      break;
+    }
+  case BTN_UP: 
+    {
+      switch_val = 1;
+      break;
+    }
+  case BTN_DOWN: 
+    {
+      switch_val = 0;
+      break;
+    }
+  case BTN_SELECT: 
+    {
+      break;
+    }
+  case BTN_NONE: 
+    {
+      break;
+    }
+  }
+}
+
+int update_switch()
+{
+  static int prev_switch_val = -1;
+  if (prev_switch_val != switch_val) {
+    if (switch_val == 1) digitalWrite(PIN_IO_SWITCH, HIGH);
+    if (switch_val == 0) digitalWrite(PIN_IO_SWITCH, LOW);
+    prev_switch_val = switch_val;
+  }
+}
+
 
 
