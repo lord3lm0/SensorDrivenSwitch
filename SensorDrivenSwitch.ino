@@ -9,23 +9,17 @@
 
 #define DEBUG 1
 
-/* 
- * settings as stored in eeprom 
- */
-struct settings {
-  byte sw_version;       /* When not equal, dismiss old data */
-  byte threshold;        /* If sensor below this value, then turn on the switch */
-  byte on_time_sec;      /* Time relais is activated, in seconds */
-  byte repeat_after_min; /* Time after when the sensor is evaluated, in minutes */
-};
-
+#define SOFTWARE_VERSION  1
 /* 
  * The location/address of the settings in eeprom memory 
  */
-#define EEPROM_SETTINGS_SW_VERSION       0
-#define EEPROM_SETTINGS_THRESHOLD        1
-#define EEPROM_SETTINGS_ON_TIME_SEC      2
-#define EEPROM_SETTINGS_REPEAT_AFTER_MIN 3
+#define NOT_STORED             -1 /* Item is not stored in eeprom */
+#define EEPROM_SW_VERSION       0 /* When not equal, dismiss old data */
+#define EEPROM_THRESHOLD        1 /* If sensor below this value, then turn on the switch */
+#define EEPROM_ON_TIME_SEC      2 /* Time relais is activated, in seconds */
+#define EEPROM_REPEAT_AFTER_MIN 3 /* Time after when the sensor is evaluated, in minutes */
+#define EEPROM_SWITCH           4 /* 0=off, 1=on, 2=auto */
+#define UNDEFINED               0xFF
 
 /* 
  * button names for buttons on lcd panel
@@ -57,25 +51,53 @@ struct settings {
 #define LCD_WIDTH           16
 #define LCD_HEIGHT          2
 
-/*
- * Menu item strings. Also define offset for values.
- *                         "0123456789ABCDEF"
- */
-const char* SENSOR_VALUE = "Sensor Read:    ";
-int SENSOR_VALUE_OFFSET = 0xC;
-const char* SWITCH_STATE = "Switch State:   ";
-int SWITCH_STATE_OFFSET = 0xD;
 
-#define NUM_MENU_ITEMS = 1;
+enum 
+{
+  OFF=0,
+  ON=1,
+  AUTO=2
+};
+const char* switch_text[] = {"Off ","On  ","Auto"};
+/*
+ * Setting Items
+ */
+enum 
+{
+  ID_SENSOR,
+  ID_SWITCH,
+  ID_THRESHOLD,
+  ID_ON_TIME,
+  ID_REPEAT_AFTER,
+  ID_VERSION,
+  ID_END
+};
+/*
+ * 
+ */
+struct setting {
+  const int id;
+  const char* text; 
+  const int line_offset;
+  const int eeprom_offset;
+  byte value;
+  byte eeprom_value;
+};
+struct setting settings[] = { /* Fill settings array with data */
+{ID_SENSOR,      "Sensor Read:    ",12, NOT_STORED,              0,                UNDEFINED}, /* 0-100% */
+{ID_SWITCH,      "Switch:         ", 8, EEPROM_SWITCH,           OFF,              UNDEFINED}, /* Off-On-Auto */
+{ID_THRESHOLD,   "Threshold:      ",10, EEPROM_THRESHOLD,        0,                UNDEFINED}, /* 0-100 */
+{ID_ON_TIME,     "On Time(sec):   ",13, EEPROM_ON_TIME_SEC,      0,                UNDEFINED}, /* 0-240 (4 minutes) */
+{ID_REPEAT_AFTER,"Repeat(min):    ",12, EEPROM_REPEAT_AFTER_MIN, 0,                UNDEFINED}, /* 0-240 (4 hours) */
+{ID_VERSION,     "Version:        ", 9, EEPROM_SW_VERSION,       SOFTWARE_VERSION, UNDEFINED}, /* Read Only */                         
+{ID_END,         0,                  0, 0,                       0,                0}          /* END */
+};
+
 
 /*
  * Global variables
  */
-int sensor_val = 0;
-int switch_val = 0;
 int menu_item = 0;
-struct settings settings_eeprom;  /* copy of setting in eeprom */
-struct settings settings_current; /* settings as currently used */
 
 LiquidCrystal lcd(PIN_IO_RS, PIN_IO_ENABLE, PIN_IO_D4, PIN_IO_D5, PIN_IO_D6, PIN_IO_D7);
 
@@ -83,9 +105,8 @@ LiquidCrystal lcd(PIN_IO_RS, PIN_IO_ENABLE, PIN_IO_D4, PIN_IO_D5, PIN_IO_D6, PIN
 /* 
  * Function prototypes 
  */
-void read_settings();
+boolean read_settings();
 void write_settings();
-void fill_default_settings();
 void sync_settings();
 int read_lcd_buttons();
 int read_sensor();
@@ -102,19 +123,16 @@ void setup()
 
   lcd.begin(LCD_WIDTH, LCD_HEIGHT);
   lcd.clear();
-  lcd.print("Wait For Serial"); 
 
 #ifdef DEBUG
+  lcd.print("Wait For Serial"); 
   Serial.begin(9600);
   while (!Serial) { /* leonardo board has no ft chip, this way we don't miss any data */
     if (read_lcd_buttons() == BTN_SELECT) break; /* But if a key is pressed we stop waiting for serial */
   }
+#else
+  lcd.print("Almigo SD Switch");
 #endif
-
-  lcd.clear();
-  lcd.print(SENSOR_VALUE);
-  lcd.setCursor(0,1);
-  lcd.print(SWITCH_STATE);
 
   /* Setting are read from eeprom when available */
   sync_settings();
@@ -132,61 +150,53 @@ void loop()
 }
 
 /*
- * read settings from eeprom
+ * read settings from eeprom, return false when software version mismatches
  */
-void read_settings()
+boolean read_settings()
 {
-  settings_eeprom.sw_version = EEPROM.read(EEPROM_SETTINGS_SW_VERSION);
-  settings_eeprom.threshold = EEPROM.read(EEPROM_SETTINGS_THRESHOLD);
-  settings_eeprom.on_time_sec = EEPROM.read(EEPROM_SETTINGS_ON_TIME_SEC);
-  settings_eeprom.repeat_after_min = EEPROM.read(EEPROM_SETTINGS_REPEAT_AFTER_MIN);
+  int i;
+  boolean sw_ok = false;
+  for (i=0; settings[i].id != ID_END; i++) {
+    if (settings[i].eeprom_offset != NOT_STORED) {
+      settings[i].eeprom_value = EEPROM.read(settings[i].eeprom_offset);
+      if (settings[i].id == ID_VERSION) { /* Check software version */
+        sw_ok = (settings[i].eeprom_value == SOFTWARE_VERSION);
+      }
+    }
+  }
+  return sw_ok;
 }
 /*
  *
  */
 void write_settings()
 {
-  if (settings_eeprom.sw_version != settings_current.sw_version) {
-    EEPROM.write(EEPROM_SETTINGS_SW_VERSION, settings_current.sw_version);
-    settings_eeprom.sw_version = settings_current.sw_version;
+  int i;
+  for (i=0; settings[i].id != ID_END; i++) {
+    if (settings[i].eeprom_offset != NOT_STORED) {
+      if (settings[i].eeprom_value != settings[i].value) {
+        EEPROM.write(settings[i].eeprom_offset, settings[i].value);
+        settings[i].eeprom_value = settings[i].value;
+      }
+    }
   }
-  if (settings_eeprom.threshold != settings_current.threshold) {
-    EEPROM.write(EEPROM_SETTINGS_THRESHOLD, settings_current.threshold);
-    settings_eeprom.threshold = settings_current.threshold;
-  }
-  if (settings_eeprom.on_time_sec != settings_current.on_time_sec) {
-    EEPROM.write(EEPROM_SETTINGS_ON_TIME_SEC, settings_current.on_time_sec);
-    settings_eeprom.on_time_sec = settings_current.on_time_sec;
-  }
-  if (settings_eeprom.repeat_after_min != settings_current.repeat_after_min) {
-    EEPROM.write(EEPROM_SETTINGS_REPEAT_AFTER_MIN, settings_current.repeat_after_min);
-    settings_eeprom.repeat_after_min = settings_current.repeat_after_min;
-  }
+}
 
-}
-/* 
- * fill_default_settings
- */
-void fill_default_settings()
-{
-  settings_current.sw_version = 1;
-  settings_current.threshold = 0; /* Never On */
-  settings_current.on_time_sec = 0; /* Never On */
-  settings_current.repeat_after_min = 60; /* 1 Hour */
-}
 /* 
  * sync_settings syncs current settings with eeprom
  */
 void sync_settings()
 {
-  fill_default_settings();
-  read_settings();
-  /* If software is newer or when the eeprom is empty, we use default settings */
-  if (settings_current.sw_version != settings_eeprom.sw_version) {
-    write_settings();
+  int i;
+  if (read_settings()) { /* software version matches, settings ok */
+    for (i=0; settings[i].id != ID_END; i++) {
+      if (settings[i].eeprom_offset != NOT_STORED) {
+        settings[i].value = settings[i].eeprom_value; /* Copy from eeprom to current */
+      }
+    }
   }
-  else { /* Copy settings from eeprom to current */
-    settings_current = settings_eeprom;
+  else { /* If software is different, we use default settings, write them to eeprom */
+    write_settings();
   }
 }
 
@@ -221,27 +231,29 @@ int read_sensor()
 {
   static int prev_sensor_val = 0;
 
-  sensor_val = analogRead(PIN_ADC_SENSOR);
+  settings[0].value = analogRead(PIN_ADC_SENSOR);
 #ifdef DEBUG
   /* Only display differences */
-  if (abs(prev_sensor_val - sensor_val) > 2) {
+  if (abs(prev_sensor_val - settings[0].value) > 2) {
     Serial.print("Sensor:");
-    Serial.println( sensor_val );   
-    prev_sensor_val = sensor_val;
+    Serial.println( settings[0].value );   
+    prev_sensor_val = settings[0].value;
   }
 #endif
-  return sensor_val;
+  return settings[0].value;
 }
 
 int draw_screen()
 {
-  lcd.setCursor(SENSOR_VALUE_OFFSET,0);
-  lcd.print( sensor_val );
+  lcd.setCursor(settings[0].line_offset,0);
+  lcd.print( settings[0].value );
   lcd.print("  ");
 
-  lcd.setCursor(SWITCH_STATE_OFFSET,1);
-  if (switch_val == 0) lcd.print("Off");
-  else lcd.print("On ");
+  lcd.setCursor(settings[menu_item].line_offset,1);
+  /* All numeric, except for ID_SWITCH */
+  if (settings[menu_item].id == ID_SWITCH) lcd.print(switch_text[settings[menu_item].value]);
+  else lcd.print(settings[menu_item].value);
+  
 }
 
 int handle_user_input()
@@ -249,6 +261,9 @@ int handle_user_input()
   switch (read_lcd_buttons())  {
   case BTN_RIGHT: 
     {
+      if (settings[menu_item].id == ID_SWITCH) {
+        settings[menu_item].value = (settings[menu_item].value+1) % AUTO;
+      }
       break;
     }
   case BTN_LEFT: 
@@ -257,12 +272,12 @@ int handle_user_input()
     }
   case BTN_UP: 
     {
-      switch_val = 1;
+      if (menu_item > 1) menu_item--;
       break;
     }
   case BTN_DOWN: 
     {
-      switch_val = 0;
+      if (settings[menu_item+1].id != ID_END) menu_item++;
       break;
     }
   case BTN_SELECT: 
@@ -279,10 +294,16 @@ int handle_user_input()
 int update_switch()
 {
   static int prev_switch_val = -1;
-  if (prev_switch_val != switch_val) {
-    if (switch_val == 1) digitalWrite(PIN_IO_SWITCH, HIGH);
-    if (switch_val == 0) digitalWrite(PIN_IO_SWITCH, LOW);
-    prev_switch_val = switch_val;
+  if (settings[ID_SWITCH].value == AUTO) {
+    /* Check sensor/time if we need to update */
+    ;
+  }
+  else { /* Manual */  
+    if (prev_switch_val != settings[ID_SWITCH].value) {
+      if (settings[ID_SWITCH].value == 1) digitalWrite(PIN_IO_SWITCH, HIGH);
+      if (settings[ID_SWITCH].value == 0) digitalWrite(PIN_IO_SWITCH, LOW);
+    }
+    prev_switch_val = settings[ID_SWITCH].value;
   }
 }
 
