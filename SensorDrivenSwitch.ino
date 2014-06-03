@@ -20,16 +20,7 @@
 #define EEPROM_REPEAT_AFTER_MIN 3 /* Time after when the sensor is evaluated, in minutes */
 #define EEPROM_SWITCH           4 /* 0=off, 1=on, 2=auto */
 #define UNDEFINED               0xFF
-
-/* 
- * button names for buttons on lcd panel
- */
-#define BTN_RIGHT  0
-#define BTN_UP     1
-#define BTN_DOWN   2
-#define BTN_LEFT   3
-#define BTN_SELECT 4
-#define BTN_NONE   5
+#define MAX_VALUE               240
 
 /* 
  * Pin layout
@@ -51,7 +42,31 @@
 #define LCD_WIDTH           16
 #define LCD_HEIGHT          2
 
+/* 
+ * button names for buttons on lcd panel
+ */
+enum {
+  BTN_RIGHT,
+  BTN_UP,
+  BTN_DOWN,
+  BTN_LEFT,
+  BTN_SELECT,
+  BTN_NONE
+};
 
+enum 
+{
+  NOT_CHANGED,
+  CHANGED
+};
+
+enum
+{
+  DRAW_NONE,
+  DRAW_SENSOR,
+  DRAW_MENU,
+  DRAW_ALL
+};
 enum 
 {
   OFF=0,
@@ -97,7 +112,7 @@ struct setting settings[] = { /* Fill settings array with data */
 /*
  * Global variables
  */
-int menu_item = 0;
+int menu_item = ID_SWITCH;
 
 LiquidCrystal lcd(PIN_IO_RS, PIN_IO_ENABLE, PIN_IO_D4, PIN_IO_D5, PIN_IO_D6, PIN_IO_D7);
 
@@ -110,7 +125,7 @@ void write_settings();
 void sync_settings();
 int read_lcd_buttons();
 int read_sensor();
-int draw_screen();
+int draw_screen(int draw);
 int handle_user_input();
 int update_switch();
 
@@ -136,6 +151,7 @@ void setup()
 
   /* Setting are read from eeprom when available */
   sync_settings();
+  draw_screen(DRAW_ALL);
 }
 
 /*
@@ -143,10 +159,18 @@ void setup()
  */
 void loop()
 {
-  read_sensor();
-  draw_screen();
-  handle_user_input();
+  int draw = DRAW_NONE;
+  if (read_sensor() == CHANGED) draw = DRAW_SENSOR;
+  
+  if (handle_user_input() == CHANGED) {
+    if (draw == DRAW_SENSOR) draw = DRAW_ALL;
+    else draw = DRAW_MENU;
+  }
+  
+  draw_screen(draw);
+  
   update_switch();
+  //delay(100);
 }
 
 /*
@@ -166,6 +190,7 @@ boolean read_settings()
   }
   return sw_ok;
 }
+
 /*
  *
  */
@@ -206,93 +231,143 @@ void sync_settings()
 int read_lcd_buttons()
 {
   static int prev_keys = 0;
+  static int count = 0;
   int keys = analogRead(PIN_ADC_LCD_BUTTONS);
-#ifdef DEBUG  
   if (abs(prev_keys - keys) > 2) {
-    Serial.println( keys );   
     prev_keys = keys;
-#endif    
+    count = 0;
   }
-
   if (keys > 1000) return BTN_NONE;   /* most likely result */
-  if (keys < 50)   return BTN_RIGHT;  /* My value: 0 */
-  if (keys < 200)  return BTN_UP;     /* My value: 100 */
-  if (keys < 400)  return BTN_DOWN;   /* My value: 257 */
-  if (keys < 600)  return BTN_LEFT;   /* My value: 410 */
-  if (keys < 800)  return BTN_SELECT; /* My value: 642 */
+  count++;
+  //Serial.println(count);
+
+  if (count >= 100) { /* Filter noise */
+    if (count == 800) {
+      count = 0;
+      return BTN_NONE; /* Auto repeat */
+    }
+    if (keys < 50)   return BTN_RIGHT;  /* My value: 0 */
+    if (keys < 200)  return BTN_UP;     /* My value: 100 */
+    if (keys < 400)  return BTN_DOWN;   /* My value: 257 */
+    if (keys < 600)  return BTN_LEFT;   /* My value: 410 */
+    if (keys < 800)  return BTN_SELECT; /* My value: 642 */
+  }
 
   return BTN_NONE;
 }
 
 /* 
- * Read sensor just reads an analog value, only in debug mode it spits out more data
+ * Read sensor just reads an analog value, checks for change
  */
 int read_sensor()
 {
   static int prev_sensor_val = 0;
+  int sensor_status = NOT_CHANGED;
 
   settings[0].value = analogRead(PIN_ADC_SENSOR);
-#ifdef DEBUG
-  /* Only display differences */
+  
   if (abs(prev_sensor_val - settings[0].value) > 2) {
-    Serial.print("Sensor:");
-    Serial.println( settings[0].value );   
     prev_sensor_val = settings[0].value;
+    sensor_status = CHANGED;
   }
-#endif
-  return settings[0].value;
+
+  return sensor_status;
 }
 
-int draw_screen()
+/*
+ *
+ */
+int draw_screen(int draw)
 {
-  lcd.setCursor(settings[0].line_offset,0);
-  lcd.print( settings[0].value );
-  lcd.print("  ");
-
-  lcd.setCursor(settings[menu_item].line_offset,1);
-  /* All numeric, except for ID_SWITCH */
-  if (settings[menu_item].id == ID_SWITCH) lcd.print(switch_text[settings[menu_item].value]);
-  else lcd.print(settings[menu_item].value);
+  if (draw == DRAW_ALL) lcd.clear();
   
+  if (draw == DRAW_ALL || draw == DRAW_SENSOR) {
+    /* First line, always sensor value */
+    lcd.setCursor(0,0);
+    lcd.print(settings[0].text);
+    lcd.setCursor(settings[0].line_offset, 0);
+    lcd.print("    ");
+    lcd.setCursor(settings[0].line_offset, 0);
+    lcd.print(settings[0].value);
+  }
+  
+  if (draw == DRAW_ALL || draw == DRAW_MENU) {
+    lcd.setCursor(0,1);
+    lcd.print(settings[menu_item].text);
+
+    lcd.setCursor(settings[menu_item].line_offset, 1);
+    lcd.print("    ");
+    lcd.setCursor(settings[menu_item].line_offset, 1);
+    /* All numeric, except for ID_SWITCH */
+    if (settings[menu_item].id == ID_SWITCH) {
+      lcd.print(switch_text[settings[menu_item].value]);
+    }
+    else {
+      lcd.print(settings[menu_item].value);
+    }
+  }
 }
 
 int handle_user_input()
 {
-  switch (read_lcd_buttons())  {
-  case BTN_RIGHT: 
-    {
+  static int prev_button_pressed = BTN_NONE;
+  int input_status = NOT_CHANGED;
+  
+  int button_pressed = read_lcd_buttons();
+  if (prev_button_pressed == button_pressed) return input_status;
+  
+  prev_button_pressed = button_pressed;
+  switch (button_pressed)  {
+  case BTN_RIGHT: {
+      if (settings[menu_item].id == ID_VERSION) break; /* Read Only */
       if (settings[menu_item].id == ID_SWITCH) {
-        settings[menu_item].value = (settings[menu_item].value+1) % AUTO;
+        settings[menu_item].value = (settings[menu_item].value+1) % 3;
       }
+      else {
+        settings[menu_item].value = (settings[menu_item].value+1) % MAX_VALUE;
+      }
+      input_status = CHANGED;
       break;
     }
-  case BTN_LEFT: 
-    {
+  case BTN_LEFT: {
+      if (settings[menu_item].id == ID_VERSION) break; /* Read Only */
+      if (settings[menu_item].value == 0) { 
+        if (settings[menu_item].id == ID_SWITCH) {
+          break; /* Don't roll over */
+        }
+        else { /* roll over */
+          settings[menu_item].value = MAX_VALUE;
+        }
+      }
+      else {
+        settings[menu_item].value--;
+      }
+      input_status = CHANGED;
       break;
     }
-  case BTN_UP: 
-    {
+  case BTN_UP: {
       if (menu_item > 1) menu_item--;
+      input_status = CHANGED;
       break;
     }
-  case BTN_DOWN: 
-    {
+  case BTN_DOWN: {
       if (settings[menu_item+1].id != ID_END) menu_item++;
+      input_status = CHANGED;
       break;
     }
-  case BTN_SELECT: 
-    {
+  case BTN_SELECT: {
       break;
     }
-  case BTN_NONE: 
-    {
+  case BTN_NONE: {
       break;
     }
   }
+  return input_status;
 }
 
 int update_switch()
 {
+  int changed = 0;
   static int prev_switch_val = -1;
   if (settings[ID_SWITCH].value == AUTO) {
     /* Check sensor/time if we need to update */
@@ -305,6 +380,7 @@ int update_switch()
     }
     prev_switch_val = settings[ID_SWITCH].value;
   }
+  return changed;
 }
 
 
