@@ -9,18 +9,18 @@
 
 #define DEBUG 1
 
-#define SOFTWARE_VERSION  1
+#define SW_VERSION  1
 /* 
  * The location/address of the settings in eeprom memory 
  */
-#define NOT_STORED             -1 /* Item is not stored in eeprom */
-#define EEPROM_SW_VERSION       0 /* When not equal, dismiss old data */
-#define EEPROM_THRESHOLD        1 /* If sensor below this value, then turn on the switch */
-#define EEPROM_ON_TIME_SEC      2 /* Time relais is activated, in seconds */
-#define EEPROM_REPEAT_AFTER_MIN 3 /* Time after when the sensor is evaluated, in minutes */
-#define EEPROM_SWITCH           4 /* 0=off, 1=on, 2=auto */
-#define UNDEFINED               0xFF
-#define MAX_VALUE               240
+#define NOT_STORED              -1 /* Item is not stored in eeprom */
+#define EEPROM_SW_VERSION        0 /* When not equal, dismiss old data */
+#define EEPROM_THRESHOLD         1 /* If sensor below this value, then turn on the switch */
+#define EEPROM_ON_TIME_SEC       2 /* Time relais is activated, in seconds */
+#define EEPROM_REPEAT_AFTER_MIN  3 /* Time after when the sensor is evaluated, in minutes */
+#define EEPROM_SWITCH            4 /* 0=off, 1=on, 2=auto */
+#define EEPROM_HYSTERESIS        5 /* Threshold + or - hysteresis */
+
 
 /* 
  * Pin layout
@@ -42,6 +42,21 @@
 #define LCD_WIDTH           16
 #define LCD_HEIGHT          2
 
+/*
+ * Draw flags, what parts of the screen do need to be drawn
+ */
+#define DRAW_NONE          0
+#define DRAW_SENSOR        1
+#define DRAW_MENU          2
+#define DRAW_ALL           3
+#define DRAW_SAVE_NEEDED   4
+
+/*
+ * The following values define how fast/slow the menu responds on button presses
+ */
+#define BUTTON_START_DELAY 1600
+#define BUTTON_REPEAT_DELAY 300
+
 /* 
  * button names for buttons on lcd panel
  */
@@ -56,24 +71,11 @@ enum {
 
 enum 
 {
-  NOT_CHANGED,
-  CHANGED
-};
-
-enum
-{
-  DRAW_NONE,
-  DRAW_SENSOR,
-  DRAW_MENU,
-  DRAW_ALL
-};
-enum 
-{
   OFF=0,
-  ON=1,
-  AUTO=2
+  AUTO=1,
+  ON=2
 };
-const char* switch_text[] = {"Off ","On  ","Auto"};
+const char* switch_text[] = {"Off ","Auto", "On  "};
 /*
  * Setting Items
  */
@@ -85,6 +87,8 @@ enum
   ID_ON_TIME,
   ID_REPEAT_AFTER,
   ID_VERSION,
+  ID_HYSTERESIS,
+  ID_MAX_SENSOR,
   ID_END
 };
 /*
@@ -97,22 +101,30 @@ struct setting {
   const int eeprom_offset;
   byte value;
   byte eeprom_value;
+  int max_value;
+  int read_only;
 };
-struct setting settings[] = { /* Fill settings array with data */
-{ID_SENSOR,      "Sensor Read:    ",12, NOT_STORED,              0,                UNDEFINED}, /* 0-100% */
-{ID_SWITCH,      "Switch:         ", 8, EEPROM_SWITCH,           OFF,              UNDEFINED}, /* Off-On-Auto */
-{ID_THRESHOLD,   "Threshold:      ",10, EEPROM_THRESHOLD,        0,                UNDEFINED}, /* 0-100 */
-{ID_ON_TIME,     "On Time(sec):   ",13, EEPROM_ON_TIME_SEC,      0,                UNDEFINED}, /* 0-240 (4 minutes) */
-{ID_REPEAT_AFTER,"Repeat(min):    ",12, EEPROM_REPEAT_AFTER_MIN, 0,                UNDEFINED}, /* 0-240 (4 hours) */
-{ID_VERSION,     "Version:        ", 9, EEPROM_SW_VERSION,       SOFTWARE_VERSION, UNDEFINED}, /* Read Only */                         
-{ID_END,         0,                  0, 0,                       0,                0}          /* END */
-};
-
 
 /*
  * Global variables
  */
+struct setting settings[] = { /* Fill settings array with data */
+/* id            text      line_offset  eeprom_offset          value,eeprom_value,max_value,read_only */
+{ID_SENSOR,      "Sensor:         ", 7, NOT_STORED,              0,          0, 255, 1}, /* 0-255 */
+{ID_SWITCH,      "Switch:         ", 8, EEPROM_SWITCH,           OFF,        0,   2, 0}, /* Off-On-Auto */
+{ID_THRESHOLD,   "Threshold:      ",10, EEPROM_THRESHOLD,        0,          0, 255, 0}, /* 0-255 */
+{ID_ON_TIME,     "On Time(sec):   ",13, EEPROM_ON_TIME_SEC,      0,          0, 240, 0}, /* 0-240 (4 minutes) */
+{ID_REPEAT_AFTER,"Repeat(min):    ",12, EEPROM_REPEAT_AFTER_MIN, 0,          0, 240, 0}, /* 0-240 (4 hours) */
+{ID_VERSION,     "Version:        ", 9, EEPROM_SW_VERSION,       SW_VERSION, 0, 100, 1}, /* Read Only */                         
+{ID_HYSTERESIS,  "Hysteresis:     ",11, EEPROM_HYSTERESIS,       0,          0, 255, 0}, /* Threshold +/- value */
+{ID_MAX_SENSOR,  "Sensor Max:     ",11, NOT_STORED,              0,          0, 255, 1}, /* Raw Sensor Value */
+{ID_END,         0,                  0, 0,                       0,          0,   0, 0}  /* END */
+};
+
+#define LINE_OFFSET_SWITCH 13
+
 int menu_item = ID_SWITCH;
+int switch_status = OFF; /* ON or OFF */
 
 LiquidCrystal lcd(PIN_IO_RS, PIN_IO_ENABLE, PIN_IO_D4, PIN_IO_D5, PIN_IO_D6, PIN_IO_D7);
 
@@ -160,17 +172,11 @@ void setup()
 void loop()
 {
   int draw = DRAW_NONE;
-  if (read_sensor() == CHANGED) draw = DRAW_SENSOR;
+  draw |= read_sensor();
+  draw |= handle_user_input();
+  draw |= update_switch();
   
-  if (handle_user_input() == CHANGED) {
-    if (draw == DRAW_SENSOR) draw = DRAW_ALL;
-    else draw = DRAW_MENU;
-  }
-  
-  draw_screen(draw);
-  
-  update_switch();
-  //delay(100);
+  draw_screen(draw);  
 }
 
 /*
@@ -184,7 +190,7 @@ boolean read_settings()
     if (settings[i].eeprom_offset != NOT_STORED) {
       settings[i].eeprom_value = EEPROM.read(settings[i].eeprom_offset);
       if (settings[i].id == ID_VERSION) { /* Check software version */
-        sw_ok = (settings[i].eeprom_value == SOFTWARE_VERSION);
+        sw_ok = (settings[i].eeprom_value == SW_VERSION);
       }
     }
   }
@@ -232,18 +238,23 @@ int read_lcd_buttons()
 {
   static int prev_keys = 0;
   static int count = 0;
+  static int button_delay = BUTTON_START_DELAY;
   int keys = analogRead(PIN_ADC_LCD_BUTTONS);
   if (abs(prev_keys - keys) > 2) {
     prev_keys = keys;
     count = 0;
   }
-  if (keys > 1000) return BTN_NONE;   /* most likely result */
+  if (keys > 1000) {
+    button_delay = BUTTON_START_DELAY;
+    return BTN_NONE;   /* most likely result */
+  }
   count++;
-  //Serial.println(count);
 
   if (count >= 100) { /* Filter noise */
-    if (count == 800) {
+    if (count == button_delay) {
+      /* Button held, simulate repeated button presses */
       count = 0;
+      button_delay = BUTTON_REPEAT_DELAY; /* Faster then original delay */
       return BTN_NONE; /* Auto repeat */
     }
     if (keys < 50)   return BTN_RIGHT;  /* My value: 0 */
@@ -262,16 +273,20 @@ int read_lcd_buttons()
 int read_sensor()
 {
   static int prev_sensor_val = 0;
-  int sensor_status = NOT_CHANGED;
-
+  int draw_status = DRAW_NONE;
+  
   settings[0].value = analogRead(PIN_ADC_SENSOR);
   
   if (abs(prev_sensor_val - settings[0].value) > 2) {
     prev_sensor_val = settings[0].value;
-    sensor_status = CHANGED;
+    draw_status = DRAW_SENSOR;
+  }
+  if (settings[ID_MAX_SENSOR].value < settings[0].value) {
+    settings[ID_MAX_SENSOR].value = settings[0].value;
+    if (menu_item == ID_MAX_SENSOR) draw_status = DRAW_ALL;
   }
 
-  return sensor_status;
+  return draw_status;
 }
 
 /*
@@ -279,9 +294,11 @@ int read_sensor()
  */
 int draw_screen(int draw)
 {
-  if (draw == DRAW_ALL) lcd.clear();
+  if (draw == DRAW_ALL) {
+    lcd.clear();
+  }
   
-  if (draw == DRAW_ALL || draw == DRAW_SENSOR) {
+  if ((draw & DRAW_SENSOR) != 0) { /* Check DRAW_SENSOR bit */
     /* First line, always sensor value */
     lcd.setCursor(0,0);
     lcd.print(settings[0].text);
@@ -289,9 +306,11 @@ int draw_screen(int draw)
     lcd.print("    ");
     lcd.setCursor(settings[0].line_offset, 0);
     lcd.print(settings[0].value);
+    lcd.setCursor(LINE_OFFSET_SWITCH,0);
+    lcd.print(switch_text[switch_status]);
   }
   
-  if (draw == DRAW_ALL || draw == DRAW_MENU) {
+  if ((draw & DRAW_MENU) != 0) { /* Check DRAW_MENU bit */
     lcd.setCursor(0,1);
     lcd.print(settings[menu_item].text);
 
@@ -305,54 +324,55 @@ int draw_screen(int draw)
     else {
       lcd.print(settings[menu_item].value);
     }
+    
+    if ((draw & DRAW_SAVE_NEEDED) != 0) {
+      lcd.setCursor(15,1);
+      lcd.print("*");
+    }
   }
+  
 }
 
 int handle_user_input()
 {
   static int prev_button_pressed = BTN_NONE;
-  int input_status = NOT_CHANGED;
+  int draw_status = DRAW_NONE;
   
   int button_pressed = read_lcd_buttons();
-  if (prev_button_pressed == button_pressed) return input_status;
+  if (prev_button_pressed == button_pressed) return draw_status;
   
   prev_button_pressed = button_pressed;
   switch (button_pressed)  {
-  case BTN_RIGHT: {
-      if (settings[menu_item].id == ID_VERSION) break; /* Read Only */
-      if (settings[menu_item].id == ID_SWITCH) {
-        settings[menu_item].value = (settings[menu_item].value+1) % 3;
-      }
-      else {
-        settings[menu_item].value = (settings[menu_item].value+1) % MAX_VALUE;
-      }
-      input_status = CHANGED;
+    case BTN_RIGHT: {
+      if (settings[menu_item].read_only == 1) break; /* Read Only */
+      if (settings[menu_item].value < settings[menu_item].max_value) {
+        settings[menu_item].value++;
+        draw_status = DRAW_MENU | DRAW_SAVE_NEEDED;
+      }            
       break;
     }
-  case BTN_LEFT: {
-      if (settings[menu_item].id == ID_VERSION) break; /* Read Only */
-      if (settings[menu_item].value == 0) { 
-        if (settings[menu_item].id == ID_SWITCH) {
-          break; /* Don't roll over */
-        }
-        else { /* roll over */
-          settings[menu_item].value = MAX_VALUE;
-        }
-      }
-      else {
+    case BTN_LEFT: {
+      if (settings[menu_item].read_only == 1) break; /* Read Only */
+      if (settings[menu_item].value > 0) { 
         settings[menu_item].value--;
+        draw_status = DRAW_MENU | DRAW_SAVE_NEEDED;
       }
-      input_status = CHANGED;
       break;
     }
   case BTN_UP: {
-      if (menu_item > 1) menu_item--;
-      input_status = CHANGED;
+      if (menu_item > 1) {
+        menu_item--;
+        draw_status = DRAW_MENU;
+      }
+      write_settings();
       break;
     }
   case BTN_DOWN: {
-      if (settings[menu_item+1].id != ID_END) menu_item++;
-      input_status = CHANGED;
+      if (settings[menu_item+1].id != ID_END) {
+        menu_item++;
+        draw_status = DRAW_MENU;
+      }
+      write_settings();
       break;
     }
   case BTN_SELECT: {
@@ -362,25 +382,47 @@ int handle_user_input()
       break;
     }
   }
-  return input_status;
+  return draw_status;
 }
 
 int update_switch()
 {
-  int changed = 0;
-  static int prev_switch_val = -1;
+  int draw_status = DRAW_NONE;
+  static int prev_switch_val = -1; /* Start with unknown */
+  int new_switch_value = settings[ID_SWITCH].value;
+  int threshold;
+  
   if (settings[ID_SWITCH].value == AUTO) {
     /* Check sensor/time if we need to update */
-    ;
-  }
-  else { /* Manual */  
-    if (prev_switch_val != settings[ID_SWITCH].value) {
-      if (settings[ID_SWITCH].value == 1) digitalWrite(PIN_IO_SWITCH, HIGH);
-      if (settings[ID_SWITCH].value == 0) digitalWrite(PIN_IO_SWITCH, LOW);
+    threshold = settings[ID_THRESHOLD].value;
+    if (switch_status == OFF) threshold -= settings[ID_HYSTERESIS].value;
+    else threshold += settings[ID_HYSTERESIS].value;
+    
+    if (settings[ID_SENSOR].value < threshold) {
+      new_switch_value = ON;
     }
-    prev_switch_val = settings[ID_SWITCH].value;
+    else {
+      new_switch_value = OFF;
+    }
   }
-  return changed;
+  /* Update the physical switch if needed */
+  if (prev_switch_val != new_switch_value) {
+    if (new_switch_value == ON) {
+      digitalWrite(PIN_IO_SWITCH, HIGH);
+      switch_status = ON;
+    }
+    else {
+      digitalWrite(PIN_IO_SWITCH, LOW);
+      switch_status = OFF;
+    }
+
+    draw_status |= DRAW_SENSOR;
+    prev_switch_val = new_switch_value;
+  }
+  
+  
+
+  return draw_status;
 }
 
 
