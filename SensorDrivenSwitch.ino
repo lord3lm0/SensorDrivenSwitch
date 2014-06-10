@@ -7,7 +7,7 @@
 #include <LiquidCrystal.h>
 #include <EEPROM.h>
 
-#define DEBUG 1
+#define DEBUG 0
 
 #define SW_VERSION  1
 /* 
@@ -17,7 +17,7 @@
 #define EEPROM_SW_VERSION        0 /* When not equal, dismiss old data */
 #define EEPROM_THRESHOLD         1 /* If sensor below this value, then turn on the switch */
 #define EEPROM_ON_TIME_SEC       2 /* Time relais is activated, in seconds */
-#define EEPROM_REPEAT_AFTER_MIN  3 /* Time after when the sensor is evaluated, in minutes */
+#define EEPROM_SLEEP_MIN         3 /* Sensor wont be evaluated until sleep is over, in minutes */
 #define EEPROM_SWITCH            4 /* 0=off, 1=on, 2=auto */
 #define EEPROM_HYSTERESIS        5 /* Threshold + or - hysteresis */
 
@@ -85,10 +85,11 @@ enum
   ID_SWITCH,
   ID_THRESHOLD,
   ID_ON_TIME,
-  ID_REPEAT_AFTER,
+  ID_SLEEP,
   ID_VERSION,
   ID_HYSTERESIS,
   ID_MAX_SENSOR,
+  ID_SLEEPING,
   ID_END
 };
 /*
@@ -97,7 +98,7 @@ enum
 struct setting {
   const int id;
   const char* text; 
-  const int line_offset;
+  int line_offset; /* Used as position where value is printed */
   const int eeprom_offset;
   byte value;
   byte eeprom_value;
@@ -110,18 +111,19 @@ struct setting {
  */
 struct setting settings[] = { /* Fill settings array with data */
 /* id            text      line_offset  eeprom_offset          value,eeprom_value,max_value,read_only */
-{ID_SENSOR,      "Sensor:         ", 7, NOT_STORED,              0,          0, 255, 1}, /* 0-255 */
-{ID_SWITCH,      "Switch:         ", 8, EEPROM_SWITCH,           OFF,        0,   2, 0}, /* Off-On-Auto */
-{ID_THRESHOLD,   "Threshold:      ",10, EEPROM_THRESHOLD,        0,          0, 255, 0}, /* 0-255 */
-{ID_ON_TIME,     "On Time(sec):   ",13, EEPROM_ON_TIME_SEC,      0,          0, 240, 0}, /* 0-240 (4 minutes) */
-{ID_REPEAT_AFTER,"Repeat(min):    ",12, EEPROM_REPEAT_AFTER_MIN, 0,          0, 240, 0}, /* 0-240 (4 hours) */
-{ID_VERSION,     "Version:        ", 9, EEPROM_SW_VERSION,       SW_VERSION, 0, 100, 1}, /* Read Only */                         
-{ID_HYSTERESIS,  "Hysteresis:     ",11, EEPROM_HYSTERESIS,       0,          0, 255, 0}, /* Threshold +/- value */
-{ID_MAX_SENSOR,  "Sensor Max:     ",11, NOT_STORED,              0,          0, 255, 1}, /* Raw Sensor Value */
+{ID_SENSOR,      "Sensor:         ", 0, NOT_STORED,              0,          0, 255, 1}, /* 0-255 */
+{ID_SWITCH,      "Switch:         ", 0, EEPROM_SWITCH,           OFF,        0,   2, 0}, /* Off-On-Auto */
+{ID_THRESHOLD,   "Threshold:      ", 0, EEPROM_THRESHOLD,        0,          0, 255, 0}, /* 0-255 */
+{ID_ON_TIME,     "On Time(sec):   ", 0, EEPROM_ON_TIME_SEC,      0,          0, 240, 0}, /* 0-240 (4 minutes) */
+{ID_SLEEP,       "Sleep(min):     ", 0, EEPROM_SLEEP_MIN,        0,          0, 240, 0}, /* 0-240 (4 hours) */
+{ID_VERSION,     "Version:        ", 0, EEPROM_SW_VERSION,       SW_VERSION, 0, 100, 1}, /* Read Only */                         
+{ID_HYSTERESIS,  "Hysteresis:     ", 0, EEPROM_HYSTERESIS,       0,          0, 255, 0}, /* Threshold +/- value */
+{ID_MAX_SENSOR,  "Sensor Max:     ", 0, NOT_STORED,              0,          0, 255, 1}, /* Raw Sensor Value */
+{ID_SLEEPING,    "Sleeping:       ", 0, NOT_STORED,              0,          0, 255, 1}, /* Calculated Time Value */
 {ID_END,         0,                  0, 0,                       0,          0,   0, 0}  /* END */
 };
 
-#define LINE_OFFSET_SWITCH 13
+#define LINE_OFFSET_SWITCH (13)  /* Display On/Off in upper corner */
 
 int menu_item = ID_SWITCH;
 int switch_status = OFF; /* ON or OFF */
@@ -140,6 +142,8 @@ int read_sensor();
 int draw_screen(int draw);
 int handle_user_input();
 int update_switch();
+int line_offset(const char* text);
+void find_line_offsets();
 
 /*
  * Every arduino program starts with the setup.
@@ -151,18 +155,17 @@ void setup()
   lcd.begin(LCD_WIDTH, LCD_HEIGHT);
   lcd.clear();
 
-#ifdef DEBUG
+#if DEBUG
   lcd.print("Wait For Serial"); 
   Serial.begin(9600);
   while (!Serial) { /* leonardo board has no ft chip, this way we don't miss any data */
     if (read_lcd_buttons() == BTN_SELECT) break; /* But if a key is pressed we stop waiting for serial */
   }
-#else
-  lcd.print("Almigo SD Switch");
 #endif
 
   /* Setting are read from eeprom when available */
   sync_settings();
+  find_line_offsets();
   draw_screen(DRAW_ALL);
 }
 
@@ -231,6 +234,24 @@ void sync_settings()
   }
 }
 
+/* Returns the offset just passed the colon, or 0 when not found */
+int line_offset(const char* text)
+{
+  int i;
+  for (i=0; text[i]; i++) {
+    if (text[i] == ':') return (i+1);
+  }
+  return 0;
+}
+
+void find_line_offsets()
+{
+  int i;
+  for (i=0; settings[i].id != ID_END; i++) {
+    settings[i].line_offset = line_offset(settings[i].text);
+  }
+}
+
 /*
  * The buttons from the lcd are connected via a adc pin, different analog values for different pins.
  */
@@ -239,6 +260,7 @@ int read_lcd_buttons()
   static int prev_keys = 0;
   static int count = 0;
   static int button_delay = BUTTON_START_DELAY;
+  int test;
   int keys = analogRead(PIN_ADC_LCD_BUTTONS);
   if (abs(prev_keys - keys) > 2) {
     prev_keys = keys;
@@ -385,26 +407,71 @@ int handle_user_input()
   return draw_status;
 }
 
+/* 
+ * Calculated from threshold +/- hysteresis 
+ */
+int get_threshold()
+{
+  int threshold; 
+  threshold = settings[ID_THRESHOLD].value;
+  if (switch_status == OFF) threshold -= settings[ID_HYSTERESIS].value;
+  else threshold += settings[ID_HYSTERESIS].value;
+  return threshold;
+}
+
+
+/* 
+ * return time in seconds
+*/
+unsigned long seconds()
+{
+  static unsigned long prev_now_milli = 0;
+  static unsigned long seconds_offset = 0;
+  unsigned long now_milli = millis();
+  if (now_milli < prev_now_milli) { /* Overflow detected */
+    seconds_offset += (0xFFFFFFFF/1000);
+  }  
+  prev_now_milli = now_milli;
+  return seconds_offset + (now_milli/1000);
+}
+
 int update_switch()
 {
   int draw_status = DRAW_NONE;
   static int prev_switch_val = -1; /* Start with unknown */
-  int new_switch_value = settings[ID_SWITCH].value;
-  int threshold;
+  int new_switch_value = settings[ID_SWITCH].value; /* On, Off or Auto*/
+
+  static unsigned long turn_off_at = 0;
+  static unsigned long sleep_until = 0;
+  unsigned long now = seconds();
+  int prev_sleeping = 0;
+
+  if (settings[ID_SWITCH].value == AUTO) { /* Check sensor and/or time for update */
+    new_switch_value = (settings[ID_SENSOR].value < get_threshold() ) ? ON : OFF;
+    /* We can show how long we will be 'sleeping' */
+    prev_sleeping = settings[ID_SLEEPING].value;
+    settings[ID_SLEEPING].value = (sleep_until > now) ? (sleep_until - now) : 0;
+    if ((prev_sleeping != settings[ID_SLEEPING].value) && (menu_item == ID_SLEEPING)) draw_status |= DRAW_MENU;
   
-  if (settings[ID_SWITCH].value == AUTO) {
-    /* Check sensor/time if we need to update */
-    threshold = settings[ID_THRESHOLD].value;
-    if (switch_status == OFF) threshold -= settings[ID_HYSTERESIS].value;
-    else threshold += settings[ID_HYSTERESIS].value;
-    
-    if (settings[ID_SENSOR].value < threshold) {
-      new_switch_value = ON;
+    if (switch_status == OFF) { /* Current switch status */
+      if ((now < sleep_until) || (new_switch_value == OFF)) return draw_status;
+      turn_off_at = now + settings[ID_ON_TIME].value;
+      sleep_until = turn_off_at + (60 * settings[ID_SLEEP].value);      
     }
-    else {
-      new_switch_value = OFF;
+    else { /* switch_status ON */
+      if (settings[ID_ON_TIME].value > 0) { /* We have a minimum on time, check if reached */
+        if (now > turn_off_at) {/* Yes, past on time */
+          if (settings[ID_SLEEP].value > 0) new_switch_value = OFF; /* But only if sleep time is required */
+        }
+        else new_switch_value = ON; /* No keep on, no matter of sensor */
+      }
     }
   }
+  else { /* In Manual mode, update settings for when we go from on to auto */
+    turn_off_at = now + settings[ID_ON_TIME].value;
+    sleep_until = turn_off_at + (60 * settings[ID_SLEEP].value);
+  }
+
   /* Update the physical switch if needed */
   if (prev_switch_val != new_switch_value) {
     if (new_switch_value == ON) {
