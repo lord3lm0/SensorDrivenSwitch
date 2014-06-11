@@ -21,6 +21,10 @@
 #define EEPROM_SWITCH            4 /* 0=off, 1=on, 2=auto */
 #define EEPROM_HYSTERESIS        5 /* Threshold + or - hysteresis */
 
+/*
+ * Walking average for sensor value
+ */
+#define HISTORY_DEPTH      100
 
 /* 
  * Pin layout
@@ -294,17 +298,34 @@ int read_lcd_buttons()
  */
 int read_sensor()
 {
-  static int prev_sensor_val = 0;
+  static int history[HISTORY_DEPTH];
+  static int pos = -1;
+  static int prev_sensor_val = 0; /* No refresh of screen when value doesn't change */
+  int current,i,total;
   int draw_status = DRAW_NONE;
   
-  settings[0].value = analogRead(PIN_ADC_SENSOR);
+  current = analogRead(PIN_ADC_SENSOR);
+  if (HISTORY_DEPTH > 1) {
+    if (pos == -1) { /* Initialize history */
+      for (pos=0; pos<HISTORY_DEPTH; pos++) history[pos] = current;
+      pos = 0;
+    }
+    else { /* Replace oldest value by current */
+      history[pos] = current;
+      pos = (pos + 1) % HISTORY_DEPTH;
+      /* Calculate total, then average */
+      for (total=0,i=0; i<HISTORY_DEPTH; i++) total += history[i];
+      current = total / HISTORY_DEPTH; 
+    }
+  }
+  settings[ID_SENSOR].value = current;
   
-  if (abs(prev_sensor_val - settings[0].value) > 2) {
-    prev_sensor_val = settings[0].value;
+  if (abs(prev_sensor_val - settings[0].value) > 0) {
+    prev_sensor_val = settings[ID_SENSOR].value;
     draw_status = DRAW_SENSOR;
   }
-  if (settings[ID_MAX_SENSOR].value < settings[0].value) {
-    settings[ID_MAX_SENSOR].value = settings[0].value;
+  if (settings[ID_MAX_SENSOR].value < settings[ID_SENSOR].value) {
+    settings[ID_MAX_SENSOR].value = settings[ID_SENSOR].value;
     if (menu_item == ID_MAX_SENSOR) draw_status = DRAW_ALL;
   }
 
@@ -316,6 +337,9 @@ int read_sensor()
  */
 int draw_screen(int draw)
 {
+  static unsigned long last_sensor_draw = 0; /* Limit sensor updates to 5 per second */
+  unsigned long now = millis();
+  
   if (draw == DRAW_ALL) {
     lcd.clear();
   }
