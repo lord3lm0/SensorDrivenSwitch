@@ -9,7 +9,7 @@
 
 #define DEBUG 0
 
-#define SW_VERSION  1
+#define SW_VERSION  2
 /* 
  * The location/address of the settings in eeprom memory 
  */
@@ -20,11 +20,12 @@
 #define EEPROM_SLEEP_MIN         3 /* Sensor wont be evaluated until sleep is over, in minutes */
 #define EEPROM_SWITCH            4 /* 0=off, 1=on, 2=auto */
 #define EEPROM_HYSTERESIS        5 /* Threshold + or - hysteresis */
+#define EEPROM_POLARITY          6 /* Switch when sensor below or above threshold */
 
 /*
  * Walking average for sensor value
  */
-#define HISTORY_DEPTH      100
+#define HISTORY_DEPTH      10
 
 /* 
  * Pin layout
@@ -49,11 +50,12 @@
 /*
  * Draw flags, what parts of the screen do need to be drawn
  */
-#define DRAW_NONE          0
-#define DRAW_SENSOR        1
-#define DRAW_MENU          2
-#define DRAW_ALL           3
-#define DRAW_SAVE_NEEDED   4
+#define DRAW_NONE          0x0
+#define DRAW_SENSOR        0x1
+#define DRAW_MENU          0x2
+#define DRAW_SWITCH        0x4
+#define DRAW_ALL           0x7
+#define DRAW_SAVE_NEEDED   0x8 /* this is kept outside of DRAW_ALL on purpose */
 
 /*
  * The following values define how fast/slow the menu responds on button presses
@@ -73,6 +75,13 @@ enum {
   BTN_NONE
 };
 
+enum
+{
+  BELOW=0,
+  ABOVE=1
+};
+const char* polarity_text[] = {"Below", "Above"};  
+
 enum 
 {
   OFF=0,
@@ -90,10 +99,11 @@ enum
   ID_THRESHOLD,
   ID_ON_TIME,
   ID_SLEEP,
-  ID_VERSION,
   ID_HYSTERESIS,
   ID_MAX_SENSOR,
   ID_SLEEPING,
+  ID_POLARITY,
+  ID_VERSION,
   ID_END
 };
 /*
@@ -120,10 +130,11 @@ struct setting settings[] = { /* Fill settings array with data */
 {ID_THRESHOLD,   "Threshold:      ", 0, EEPROM_THRESHOLD,        0,          0, 255, 0}, /* 0-255 */
 {ID_ON_TIME,     "On Time(sec):   ", 0, EEPROM_ON_TIME_SEC,      0,          0, 240, 0}, /* 0-240 (4 minutes) */
 {ID_SLEEP,       "Sleep(min):     ", 0, EEPROM_SLEEP_MIN,        0,          0, 240, 0}, /* 0-240 (4 hours) */
-{ID_VERSION,     "Version:        ", 0, EEPROM_SW_VERSION,       SW_VERSION, 0, 100, 1}, /* Read Only */                         
 {ID_HYSTERESIS,  "Hysteresis:     ", 0, EEPROM_HYSTERESIS,       0,          0, 255, 0}, /* Threshold +/- value */
 {ID_MAX_SENSOR,  "Sensor Max:     ", 0, NOT_STORED,              0,          0, 255, 1}, /* Raw Sensor Value */
 {ID_SLEEPING,    "Sleeping:       ", 0, NOT_STORED,              0,          0, 255, 1}, /* Calculated Time Value */
+{ID_POLARITY,    "Polarity:       ", 0, EEPROM_POLARITY,         BELOW,      0,   1, 0}, /* Threshold Polarity */
+{ID_VERSION,     "Version:        ", 0, EEPROM_SW_VERSION,       SW_VERSION, 0, 100, 1}, /* Read Only */                         
 {ID_END,         0,                  0, 0,                       0,          0,   0, 0}  /* END */
 };
 
@@ -148,6 +159,7 @@ int handle_user_input();
 int update_switch();
 int line_offset(const char* text);
 void find_line_offsets();
+int walking_average(int new_value);
 
 /*
  * Every arduino program starts with the setup.
@@ -264,7 +276,7 @@ int read_lcd_buttons()
   static int prev_keys = 0;
   static int count = 0;
   static int button_delay = BUTTON_START_DELAY;
-  int test;
+
   int keys = analogRead(PIN_ADC_LCD_BUTTONS);
   if (abs(prev_keys - keys) > 2) {
     prev_keys = keys;
@@ -293,32 +305,43 @@ int read_lcd_buttons()
   return BTN_NONE;
 }
 
+/*
+ * calculates a walking average with a depth of HISTORY_DEPTH numbers
+ * this method irons out glitches
+ */
+int walking_average(int new_value)
+{
+  static int pos = -1;
+  static int history[HISTORY_DEPTH];
+  int i,total;
+  
+  if (HISTORY_DEPTH > 1) {
+    if (pos == -1) { /* Initialize history */
+      for (pos=0; pos<HISTORY_DEPTH; pos++) history[pos] = new_value;
+      pos = 0;
+    }
+    else { /* Replace oldest value by current */
+      history[pos] = new_value;
+      pos = (pos + 1) % HISTORY_DEPTH;
+      /* Calculate total, then average */
+      for (total=0,i=0; i<HISTORY_DEPTH; i++) total += history[i];
+      new_value = total / HISTORY_DEPTH; 
+    }
+  }
+  return new_value;
+}
+
 /* 
  * Read sensor just reads an analog value, checks for change
  */
 int read_sensor()
 {
-  static int history[HISTORY_DEPTH];
-  static int pos = -1;
   static int prev_sensor_val = 0; /* No refresh of screen when value doesn't change */
-  int current,i,total;
+  int current;
   int draw_status = DRAW_NONE;
   
   current = analogRead(PIN_ADC_SENSOR);
-  if (HISTORY_DEPTH > 1) {
-    if (pos == -1) { /* Initialize history */
-      for (pos=0; pos<HISTORY_DEPTH; pos++) history[pos] = current;
-      pos = 0;
-    }
-    else { /* Replace oldest value by current */
-      history[pos] = current;
-      pos = (pos + 1) % HISTORY_DEPTH;
-      /* Calculate total, then average */
-      for (total=0,i=0; i<HISTORY_DEPTH; i++) total += history[i];
-      current = total / HISTORY_DEPTH; 
-    }
-  }
-  settings[ID_SENSOR].value = current;
+  settings[ID_SENSOR].value = walking_average(current);
   
   if (abs(prev_sensor_val - settings[0].value) > 0) {
     prev_sensor_val = settings[ID_SENSOR].value;
@@ -333,51 +356,73 @@ int read_sensor()
 }
 
 /*
- *
+ * 2 lines are drawn depending on changes. First line is always the sensor value and switch status
+ * second is a parameter. 
  */
 int draw_screen(int draw)
 {
-  static unsigned long last_sensor_draw = 0; /* Limit sensor updates to 5 per second */
-  unsigned long now = millis();
+  static int postpone_sensor = 1;
+  static unsigned long next_sensor_draw_time = 0;
+  int num_bytes;
   
   if (draw == DRAW_ALL) {
     lcd.clear();
-  }
-  
-  if ((draw & DRAW_SENSOR) != 0) { /* Check DRAW_SENSOR bit */
     /* First line, always sensor value */
     lcd.setCursor(0,0);
-    lcd.print(settings[0].text);
-    lcd.setCursor(settings[0].line_offset, 0);
-    lcd.print("    ");
-    lcd.setCursor(settings[0].line_offset, 0);
-    lcd.print(settings[0].value);
+    lcd.print(settings[ID_SENSOR].text);
+  }
+  
+  if (draw & DRAW_SENSOR) postpone_sensor = 1;
+  if (postpone_sensor && (millis() > next_sensor_draw_time)) {
+    postpone_sensor = 0;
+    next_sensor_draw_time = millis() + 250; /* max 4 updates per second */
+    lcd.setCursor(settings[ID_SENSOR].line_offset, 0);
+    //lcd.print("    ");
+    lcd.setCursor(settings[ID_SENSOR].line_offset, 0);
+    num_bytes = lcd.print(settings[0].value);
+    if (num_bytes < 3) {
+      lcd.print( (num_bytes==1) ? "  " : " "); /* Print 1 or 2 spaces to clear previous value */
+    }
+  }
+  
+  if (draw & DRAW_SWITCH) {
     lcd.setCursor(LINE_OFFSET_SWITCH,0);
     lcd.print(switch_text[switch_status]);
   }
   
-  if ((draw & DRAW_MENU) != 0) { /* Check DRAW_MENU bit */
+  if (draw & DRAW_MENU) { /* Check DRAW_MENU bit */
     lcd.setCursor(0,1);
     lcd.print(settings[menu_item].text);
 
     lcd.setCursor(settings[menu_item].line_offset, 1);
     lcd.print("    ");
     lcd.setCursor(settings[menu_item].line_offset, 1);
-    /* All numeric, except for ID_SWITCH */
-    if (settings[menu_item].id == ID_SWITCH) {
-      lcd.print(switch_text[settings[menu_item].value]);
-    }
-    else {
-      lcd.print(settings[menu_item].value);
+    /* All numeric, except for ID_SWITCH and ID_POLARITY*/
+    switch(settings[menu_item].id) {
+      case ID_SWITCH: {
+        lcd.print(switch_text[settings[menu_item].value]);
+        break;
+      }
+      case ID_POLARITY: {
+        lcd.print(polarity_text[settings[menu_item].value]);
+        break;
+      }
+      default: {
+        lcd.print(settings[menu_item].value);
+      }
     }
     
     if ((draw & DRAW_SAVE_NEEDED) != 0) {
-      lcd.setCursor(15,1);
+      lcd.setCursor(15,1); /* Last char on bottom line */
       lcd.print("*");
     }
   }
-  
+  return 0; 
 }
+
+/*
+ * Buttons are polled and next menu item is calculated
+ */
 
 int handle_user_input()
 {
@@ -432,19 +477,6 @@ int handle_user_input()
 }
 
 /* 
- * Calculated from threshold +/- hysteresis 
- */
-int get_threshold()
-{
-  int threshold; 
-  threshold = settings[ID_THRESHOLD].value;
-  if (switch_status == OFF) threshold -= settings[ID_HYSTERESIS].value;
-  else threshold += settings[ID_HYSTERESIS].value;
-  return threshold;
-}
-
-
-/* 
  * return time in seconds
 */
 unsigned long seconds()
@@ -462,8 +494,11 @@ unsigned long seconds()
 int update_switch()
 {
   int draw_status = DRAW_NONE;
-  static int prev_switch_val = -1; /* Start with unknown */
+  static int prev_switch_val = -1; /* Start with unknown previous switch state */
   int new_switch_value = settings[ID_SWITCH].value; /* On, Off or Auto*/
+  int polarity = settings[ID_POLARITY].value; /* Below or Above */
+  int lower_threshold = settings[ID_THRESHOLD].value - settings[ID_HYSTERESIS].value;
+  int upper_threshold = settings[ID_THRESHOLD].value + settings[ID_HYSTERESIS].value;
 
   static unsigned long turn_off_at = 0;
   static unsigned long sleep_until = 0;
@@ -471,7 +506,10 @@ int update_switch()
   int prev_sleeping = 0;
 
   if (settings[ID_SWITCH].value == AUTO) { /* Check sensor and/or time for update */
-    new_switch_value = (settings[ID_SENSOR].value < get_threshold() ) ? ON : OFF;
+    if (settings[ID_SENSOR].value < lower_threshold)  new_switch_value = (polarity==BELOW) ? ON : OFF;
+    else if (settings[ID_SENSOR].value >= upper_threshold) new_switch_value = (polarity==ABOVE) ? ON : OFF;
+    else new_switch_value = switch_status;
+    
     /* We can show how long we will be 'sleeping' */
     prev_sleeping = settings[ID_SLEEPING].value;
     settings[ID_SLEEPING].value = (sleep_until > now) ? (sleep_until - now) : 0;
@@ -507,7 +545,7 @@ int update_switch()
       switch_status = OFF;
     }
 
-    draw_status |= DRAW_SENSOR;
+    draw_status |= DRAW_SWITCH;
     prev_switch_val = new_switch_value;
   }
   
