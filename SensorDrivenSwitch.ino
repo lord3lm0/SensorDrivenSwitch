@@ -21,6 +21,7 @@
 #define EEPROM_SWITCH            4 /* 0=off, 1=on, 2=auto */
 #define EEPROM_HYSTERESIS        5 /* Threshold + or - hysteresis */
 #define EEPROM_POLARITY          6 /* Switch when sensor below or above threshold */
+#define EEPROM_RESET_COUNT       7 /* Count number of resets/boots/turn on */
 
 /*
  * Walking average for sensor value
@@ -105,6 +106,7 @@ enum
   ID_POLARITY,
   ID_CYCLE_COUNT,
   ID_UPTIME,
+  ID_RESET_COUNT,
   ID_VERSION,
   ID_END
 };
@@ -138,6 +140,7 @@ struct setting settings[] = { /* Fill settings array with data */
 {ID_POLARITY,    "Polarity:       ", 0, EEPROM_POLARITY,         BELOW,      0,   1, 0}, /* Threshold Polarity */
 {ID_CYCLE_COUNT, "Cycles:         ", 0, NOT_STORED,              0,          0,  -1, 1}, /* Read Only */                         
 {ID_UPTIME,      "Up:             ", 0, NOT_STORED,              0,          0,  -1, 1}, /* Read Only */  
+{ID_RESET_COUNT, "Reset Count:    ", 0, EEPROM_RESET_COUNT,      0,          0, 255, 0}, /* Increase every start */  
 {ID_VERSION,     "Version:        ", 0, EEPROM_SW_VERSION,       SW_VERSION, 0, 100, 1}, /* Read Only */  
 {ID_END,         0,                  0, 0,                       0,          0,   0, 0}  /* END */
 };
@@ -251,9 +254,10 @@ void sync_settings()
       }
     }
   }
-  else { /* If software is different, we use default settings, write them to eeprom */
-    write_settings();
-  }
+  settings[ID_RESET_COUNT].value += 1;
+  /* If software is different, we use default settings, write them to eeprom */
+  write_settings();
+  
 }
 
 /* Returns the offset just passed the colon, or 0 when not found */
@@ -501,7 +505,7 @@ unsigned long seconds()
   return seconds_offset + (now_milli/1000);
 }
 
-#define SECONDS_IN_A_MINUTE  (60)
+#define SECONDS_IN_A_MINUTE  (60L)
 #define SECONDS_IN_AN_HOUR   (60 * SECONDS_IN_A_MINUTE)
 #define SECONDS_IN_A_DAY     (24 * SECONDS_IN_AN_HOUR)
 
@@ -512,17 +516,17 @@ int lookup_decimal[] = {0,1,10,100,1000,10000,100000}; /* same as 10**i  */
 */
 int itoa(char* dest, int num, int width, char pad0)
 {
-  int i, first_digit_past=0, pos=0;
+  int i, past_first_digit=0, pos=0;
   div_t result;
   result.rem = num;
   for (i=0; i<width; i++) {
     result = div(result.rem, lookup_decimal[width-i]);
-    if ((first_digit_past == 0) && (result.quot==0) && (i<(width-1))) {
+    if ((past_first_digit == 0) && (result.quot==0) && (i<(width-1))) {
       dest[pos] = pad0;
       if (pad0 != 0) pos++;  
     }
     else {
-      first_digit_past = 1;
+      past_first_digit = 1;
       dest[pos] = '0' + result.quot;
       pos++;
     }
@@ -534,19 +538,15 @@ const char* uptime()
 {
   static char text[16];
   unsigned long time = seconds();
-  div_t result; 
+  unsigned long rem; 
   int days, hours, minutes, seconds, pos=0;
-  //for (pos=15; pos>0; pos--) {
-  //  text[pos] = 0;
-  //}
   
-  result = div(time, SECONDS_IN_A_DAY);
-  days = result.quot;
-  result = div(result.rem, SECONDS_IN_AN_HOUR);
-  hours = result.quot;
-  result = div(result.rem, SECONDS_IN_A_MINUTE);
-  minutes = result.quot;
-  seconds = result.rem;
+  days = time / SECONDS_IN_A_DAY;
+  rem = time % SECONDS_IN_A_DAY;
+  hours = rem / SECONDS_IN_AN_HOUR;
+  rem = rem % SECONDS_IN_AN_HOUR;
+  minutes = rem / SECONDS_IN_A_MINUTE;
+  seconds = rem % SECONDS_IN_A_MINUTE;
   
   pos += itoa(text+pos, days, 3, ' ');
   text[pos] = 'd'; pos++;
