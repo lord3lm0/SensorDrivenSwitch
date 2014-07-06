@@ -9,7 +9,7 @@
 
 #define DEBUG 0
 
-#define SW_VERSION  2
+#define SW_VERSION  3
 /* 
  * The location/address of the settings in eeprom memory 
  */
@@ -44,6 +44,7 @@
 #define PIN_IO_D5           5
 #define PIN_IO_D6           6
 #define PIN_IO_D7           7
+#define PIN_BACKLIGHT       10
 
 #define LCD_WIDTH           16
 #define LCD_HEIGHT          2
@@ -149,6 +150,7 @@ struct setting settings[] = { /* Fill settings array with data */
 
 int menu_item = ID_SWITCH;
 int switch_status = OFF; /* ON or OFF */
+unsigned long last_button_press = 0;
 
 LiquidCrystal lcd(PIN_IO_RS, PIN_IO_ENABLE, PIN_IO_D4, PIN_IO_D5, PIN_IO_D6, PIN_IO_D7);
 
@@ -169,6 +171,7 @@ void find_line_offsets();
 int walking_average(int new_value);
 unsigned long seconds();
 const char* uptime();
+void handle_screen_fadeout();
 
 /*
  * Every arduino program starts with the setup.
@@ -204,9 +207,32 @@ void loop()
   draw |= handle_user_input();
   draw |= update_switch();
   
-  draw_screen(draw);  
+  draw_screen(draw);
+  handle_screen_fadeout();  
 }
 
+#define BACKLIGHT_OFF_AFTER     10000L  /* in milliseconds */  
+#define BACKLIGHT_FADE_DURATION  5000L  /* in mmiliseconds */  
+
+void handle_screen_fadeout()
+{
+  unsigned long brightness,time_since_fade;
+  unsigned long time_since_last_button = millis() - last_button_press;
+  if (time_since_last_button > BACKLIGHT_OFF_AFTER) {
+    if (time_since_last_button > (BACKLIGHT_OFF_AFTER + BACKLIGHT_FADE_DURATION)) { 
+      analogWrite(PIN_BACKLIGHT,0); /* Full Off */ 
+    }
+    else {
+      time_since_fade = time_since_last_button-BACKLIGHT_OFF_AFTER;
+      brightness = 255- ((time_since_fade/float(BACKLIGHT_FADE_DURATION))*255);
+      analogWrite(PIN_BACKLIGHT, brightness);
+    }
+  }
+  else {
+    analogWrite(PIN_BACKLIGHT,255); /* Full On */ 
+  }
+   
+}
 /*
  * read settings from eeprom, return false when software version mismatches
  */
@@ -292,13 +318,14 @@ int read_lcd_buttons()
     prev_keys = keys;
     count = 0;
   }
-  if (keys > 1000) {
+  if (keys > 1000) { /* most likely result, return early */
     button_delay = BUTTON_START_DELAY;
-    return BTN_NONE;   /* most likely result */
+    return BTN_NONE;   
   }
   count++;
-
+  
   if (count >= 100) { /* Filter noise */
+    last_button_press = millis();
     if (count == button_delay) {
       /* Button held, simulate repeated button presses */
       count = 0;
