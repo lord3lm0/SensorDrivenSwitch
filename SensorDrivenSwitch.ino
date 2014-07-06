@@ -65,6 +65,12 @@
 #define BUTTON_START_DELAY 1600
 #define BUTTON_REPEAT_DELAY 300
 
+/*
+ * The backlight can be faded.
+ */
+#define BACKLIGHT_OFF_AFTER     60000L  /* in milliseconds */  
+#define BACKLIGHT_FADE_DURATION  5000L  /* in milliseconds */  
+
 /* 
  * button names for buttons on lcd panel
  */
@@ -210,9 +216,6 @@ void loop()
   draw_screen(draw);
   handle_screen_fadeout();  
 }
-
-#define BACKLIGHT_OFF_AFTER     10000L  /* in milliseconds */  
-#define BACKLIGHT_FADE_DURATION  5000L  /* in mmiliseconds */  
 
 void handle_screen_fadeout()
 {
