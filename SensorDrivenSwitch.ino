@@ -350,8 +350,8 @@ int read_sensor()
   int current;
   int draw_status = DRAW_NONE;
   
-  current = analogRead(PIN_ADC_SENSOR);
-  settings[ID_SENSOR].value = walking_average(current);
+  current = analogRead(PIN_ADC_SENSOR) / 4; /* scale the range to [0-255] */
+  settings[ID_SENSOR].value = walking_average(current); 
   
   if (abs(prev_sensor_val - settings[0].value) > 0) {
     prev_sensor_val = settings[ID_SENSOR].value;
